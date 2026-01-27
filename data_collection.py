@@ -3,6 +3,7 @@ import csv
 import datetime
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -33,8 +34,6 @@ ESPN_BET_PROVIDER_IDS = {"58", "59"}
 DRAFTKINGS_PROVIDER_IDS = {"100"}
 REQUEST_TIMEOUT_SECONDS = 10
 REGULAR_SEASON_TYPE = 2
-
-
 def fetch_acc_teams():
     with urllib.request.urlopen(GROUPS_URL) as response:
         data = json.load(response)
@@ -242,8 +241,6 @@ def normalize_team_name(name):
     return " ".join(text.split()).strip()
 
 
-
-
 def fetch_team_season_stats(
     team_id,
     team_name,
@@ -301,6 +298,55 @@ def collect_team_season_stats(
         if row:
             rows.append(row)
     return rows
+
+
+def get_latest_game_dates(games):
+    """Get the latest game date for each team from games list."""
+    latest_dates = {}
+    for game in games:
+        date_str = game.get("date")
+        for team_id in [game.get("home_team_id"), game.get("away_team_id")]:
+            if not team_id or not date_str:
+                continue
+            team_id = str(team_id)
+            if team_id not in latest_dates or date_str > latest_dates[team_id]:
+                latest_dates[team_id] = date_str
+    return latest_dates
+
+
+def load_torvik_ratings(torvik_path):
+    """Load torvik_asof_ratings.csv into a dict keyed by (team_id, date)."""
+    ratings = {}
+    if not os.path.exists(torvik_path):
+        return ratings
+    with open(torvik_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            key = (str(row.get("team_id")), row.get("date"))
+            ratings[key] = {
+                "barthag": row.get("barthag"),
+                "adj_o": row.get("adj_o"),
+                "adj_d": row.get("adj_d"),
+                "adj_tempo": row.get("adj_tempo"),
+                "wab": row.get("wab"),
+            }
+    return ratings
+
+
+def merge_torvik_into_season_stats(season_stats, games, torvik_path):
+    """Merge latest Torvik ratings into season stats rows."""
+    latest_dates = get_latest_game_dates(games)
+    torvik_ratings = load_torvik_ratings(torvik_path)
+    for row in season_stats:
+        team_id = str(row.get("team_id"))
+        date_str = latest_dates.get(team_id)
+        if not date_str:
+            continue
+        torvik = torvik_ratings.get((team_id, date_str), {})
+        row["barthag"] = torvik.get("barthag")
+        row["adj_o"] = torvik.get("adj_o")
+        row["adj_d"] = torvik.get("adj_d")
+        row["adj_tempo"] = torvik.get("adj_tempo")
+        row["wab"] = torvik.get("wab")
 
 
 def write_team_season_stats_csv(rows, output_path):
@@ -377,6 +423,13 @@ def main():
     output_path = os.path.join("data", "acc_teams.csv")
     write_acc_csv(teams, output_path)
     print(f"Wrote {len(teams)} teams to {output_path}")
+    team_name_by_id = {
+        team.get("id"): normalize_team_name(
+            team.get("shortDisplayName") or team.get("displayName") or team.get("name")
+        )
+        for team in teams
+        if team.get("id")
+    }
     season_year = current_season_year()
     games = fetch_acc_games(teams, season_year)
     add_draftkings_spreads(games)
@@ -391,6 +444,8 @@ def main():
     write_team_stats_csv(team_stats, team_stats_output)
     print(f"Wrote {len(team_stats)} team stat rows to {team_stats_output}")
     season_stats = collect_team_season_stats(teams, season_year)
+    torvik_path = os.path.join("data", "torvik_asof_ratings.csv")
+    merge_torvik_into_season_stats(season_stats, games, torvik_path)
     season_stats_output = os.path.join("data", "acc_team_season_stats.csv")
     write_team_season_stats_csv(season_stats, season_stats_output)
     print(f"Wrote {len(season_stats)} team season stat rows to {season_stats_output}")
