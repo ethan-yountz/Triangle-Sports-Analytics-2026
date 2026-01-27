@@ -387,7 +387,7 @@ def main():
     )
     team_stats = collect_team_stats([game["event_id"] for game in games])
     team_stats = add_game_dates_to_team_stats(team_stats, games)
-    team_stats_output = os.path.join("data", "acc_team_stats.csv")
+    team_stats_output = os.path.join("data", "acc_game_stats.csv")
     write_team_stats_csv(team_stats, team_stats_output)
     print(f"Wrote {len(team_stats)} team stat rows to {team_stats_output}")
     season_stats = collect_team_season_stats(teams, season_year)
