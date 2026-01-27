@@ -1,7 +1,9 @@
+import concurrent.futures
 import csv
 import datetime
 import json
 import os
+import urllib.error
 import urllib.request
 
 
@@ -13,6 +15,24 @@ TEAM_SCHEDULE_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/"
     "basketball/mens-college-basketball/teams/{team_id}/schedule?season={season}"
 )
+SUMMARY_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/"
+    "basketball/mens-college-basketball/summary?event={event_id}"
+)
+TEAM_SEASON_STATS_URL = (
+    "https://sports.core.api.espn.com/v2/sports/basketball/"
+    "leagues/mens-college-basketball/seasons/{season}/types/{season_type}/"
+    "teams/{team_id}/statistics"
+)
+ODDS_URL = (
+    "https://sports.core.api.espn.com/v2/sports/"
+    "basketball/leagues/mens-college-basketball/events/{event_id}/"
+    "competitions/{competition_id}/odds"
+)
+ESPN_BET_PROVIDER_IDS = {"58", "59"}
+DRAFTKINGS_PROVIDER_IDS = {"100"}
+REQUEST_TIMEOUT_SECONDS = 10
+REGULAR_SEASON_TYPE = 2
 
 
 def fetch_acc_teams():
@@ -67,6 +87,49 @@ def parse_event_date(event_date):
     return event_date.split("T", 1)[0]
 
 
+def fetch_preferred_spread(event_id, competition_id):
+    odds_url = ODDS_URL.format(event_id=event_id, competition_id=competition_id)
+    try:
+        with urllib.request.urlopen(odds_url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    fallback_spread = None
+    for item in data.get("items", []):
+        provider_id = item.get("provider", {}).get("id")
+        if provider_id is None:
+            continue
+        provider_id = str(provider_id)
+        spread = item.get("spread")
+        try:
+            spread_value = float(spread)
+        except (TypeError, ValueError):
+            spread_value = None
+        if provider_id in ESPN_BET_PROVIDER_IDS and spread_value is not None:
+            return spread_value
+        if provider_id in DRAFTKINGS_PROVIDER_IDS and spread_value is not None:
+            fallback_spread = spread_value
+    return fallback_spread
+
+
+def add_draftkings_spreads(games, max_workers=8):
+    game_by_event = {game.get("event_id"): game for game in games if game.get("event_id")}
+
+    def fetch_for_game(game):
+        event_id = game.get("event_id")
+        competition_id = game.get("competition_id")
+        if not event_id or not competition_id:
+            return event_id, None
+        return event_id, fetch_preferred_spread(event_id, competition_id)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(fetch_for_game, game) for game in games]
+        for future in concurrent.futures.as_completed(futures):
+            event_id, spread = future.result()
+            if event_id in game_by_event:
+                game_by_event[event_id]["spread"] = spread
+
+
 def fetch_acc_games(teams, season_year):
     games = {}
     for team in teams:
@@ -84,6 +147,7 @@ def fetch_acc_games(teams, season_year):
             status = competition.get("status", {}).get("type", {})
             if not status.get("completed"):
                 continue
+            competition_id = competition.get("id") or event_id
             competitors = competition.get("competitors", [])
             home = next((c for c in competitors if c.get("homeAway") == "home"), {})
             away = next((c for c in competitors if c.get("homeAway") == "away"), {})
@@ -100,13 +164,179 @@ def fetch_acc_games(teams, season_year):
                 "home_score": home_score,
                 "away_score": away_score,
                 "neutral_site": neutral_site,
+                "spread": None,
                 "margin": (
                     home_score - away_score
                     if home_score is not None and away_score is not None
                     else None
                 ),
+                "competition_id": competition_id,
             }
     return list(games.values())
+
+
+def fetch_event_team_stats(event_id):
+    summary_url = SUMMARY_URL.format(event_id=event_id)
+    try:
+        with urllib.request.urlopen(summary_url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+        return []
+    teams = data.get("boxscore", {}).get("teams", [])
+    rows = []
+    for team in teams:
+        team_id = team.get("team", {}).get("id")
+        if not team_id:
+            continue
+        row = {
+            "event_id": event_id,
+            "team_id": team_id,
+        }
+        for stat in team.get("statistics", []):
+            name = stat.get("name")
+            if not name:
+                continue
+            row[name] = stat.get("displayValue")
+        rows.append(row)
+    return rows
+
+
+def collect_team_stats(event_ids, max_workers=8):
+    rows = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(fetch_event_team_stats, event_id) for event_id in event_ids]
+        for future in concurrent.futures.as_completed(futures):
+            rows.extend(future.result())
+    return rows
+
+
+def add_game_dates_to_team_stats(rows, games):
+    event_dates = {game.get("event_id"): game.get("date") for game in games}
+    for row in rows:
+        row["date"] = event_dates.get(row.get("event_id"))
+    return rows
+
+
+def parse_float_value(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace(",", "").strip()
+    if "/" in text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def normalize_team_name(name):
+    if not name:
+        return ""
+    text = name.lower()
+    text = text.split("(")[0]
+    text = text.replace("&", "and")
+    for ch in [".", "'", "\""]:
+        text = text.replace(ch, "")
+    return " ".join(text.split()).strip()
+
+
+
+
+def fetch_team_season_stats(
+    team_id,
+    team_name,
+    season_year,
+    season_type=REGULAR_SEASON_TYPE,
+):
+    stats_url = TEAM_SEASON_STATS_URL.format(
+        season=season_year, season_type=season_type, team_id=team_id
+    )
+    try:
+        with urllib.request.urlopen(stats_url, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+    except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+        return None
+    row = {
+        "team_id": team_id,
+        "team_name": team_name,
+        "season": season_year,
+        "season_type": season_type,
+    }
+    for category in data.get("splits", {}).get("categories", []):
+        for stat in category.get("stats", []):
+            name = stat.get("name")
+            if not name:
+                continue
+            row[name] = stat.get("displayValue") or stat.get("value")
+    avg_possessions = parse_float_value(row.get("avgEstimatedPossessions"))
+    if avg_possessions is None:
+        total_possessions = parse_float_value(row.get("estimatedPossessions"))
+        games_played = parse_float_value(row.get("gamesPlayed"))
+        if total_possessions is not None and games_played:
+            avg_possessions = total_possessions / games_played
+    if avg_possessions is not None:
+        row["pace"] = round(avg_possessions, 1)
+    return row
+
+
+def collect_team_season_stats(
+    teams,
+    season_year,
+    season_type=REGULAR_SEASON_TYPE,
+):
+    rows = []
+    for team in teams:
+        team_id = team.get("id")
+        if not team_id:
+            continue
+        team_name = team.get("displayName") or team.get("name")
+        row = fetch_team_season_stats(
+            team_id,
+            team_name,
+            season_year,
+            season_type=season_type,
+        )
+        if row:
+            rows.append(row)
+    return rows
+
+
+def write_team_season_stats_csv(rows, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    stat_columns = sorted(
+        {
+            key
+            for row in rows
+            for key in row.keys()
+            if key not in {"team_id", "team_name", "season", "season_type"}
+        }
+    )
+    headers = ["team_id", "team_name", "season", "season_type"] + stat_columns
+    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow([row.get(header) for header in headers])
+
+
+def write_team_stats_csv(rows, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    stat_columns = sorted(
+        {
+            key
+            for row in rows
+            for key in row.keys()
+            if key not in {"event_id", "team_id", "date"}
+        }
+    )
+    headers = ["event_id", "team_id", "date"] + stat_columns
+    with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow([row.get(header) for header in headers])
 
 
 def write_acc_games_csv(games, output_path):
@@ -122,6 +352,7 @@ def write_acc_games_csv(games, output_path):
                 "home_score",
                 "away_score",
                 "neutral_site",
+                "spread",
                 "margin",
             ]
         )
@@ -135,6 +366,7 @@ def write_acc_games_csv(games, output_path):
                     game.get("home_score"),
                     game.get("away_score"),
                     game.get("neutral_site"),
+                    game.get("spread"),
                     game.get("margin"),
                 ]
             )
@@ -147,11 +379,21 @@ def main():
     print(f"Wrote {len(teams)} teams to {output_path}")
     season_year = current_season_year()
     games = fetch_acc_games(teams, season_year)
+    add_draftkings_spreads(games)
     games_output_path = os.path.join("data", "acc_games.csv")
     write_acc_games_csv(games, games_output_path)
     print(
         f"Wrote {len(games)} ACC games for season {season_year} to {games_output_path}"
     )
+    team_stats = collect_team_stats([game["event_id"] for game in games])
+    team_stats = add_game_dates_to_team_stats(team_stats, games)
+    team_stats_output = os.path.join("data", "acc_team_stats.csv")
+    write_team_stats_csv(team_stats, team_stats_output)
+    print(f"Wrote {len(team_stats)} team stat rows to {team_stats_output}")
+    season_stats = collect_team_season_stats(teams, season_year)
+    season_stats_output = os.path.join("data", "acc_team_season_stats.csv")
+    write_team_season_stats_csv(season_stats, season_stats_output)
+    print(f"Wrote {len(season_stats)} team season stat rows to {season_stats_output}")
 
 
 if __name__ == "__main__":
