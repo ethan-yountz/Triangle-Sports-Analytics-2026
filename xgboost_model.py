@@ -1,13 +1,4 @@
-"""
-XGBoost spread model with fixed-cutoff evaluation and market comparison.
-
-Design:
-- Fixed 80/20 chronological split.
-- Prior-day Torvik join (as_of_date = game_date - 1 day).
-- Fixed-cutoff snapshot replacement for post-cutoff rows.
-- Ridge baseline prediction included as feature: ridge_pred_spread.
-- Early stopping using a chronological validation slice from training data.
-"""
+"""Train and evaluate a fixed-cutoff XGBoost spread model."""
 
 import os
 from typing import Dict, List, Optional
@@ -65,24 +56,20 @@ def merge_torvik_asof(games: pd.DataFrame, torvik: pd.DataFrame, stat_cols: List
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    # Base 4
     out["adj_o_diff"] = out["home_adj_o"] - out["away_adj_o"]
     out["adj_d_diff"] = out["home_adj_d"] - out["away_adj_d"]
     out["efg_diff"] = out["home_efg"] - out["away_efg"]
     out["is_neutral"] = out["neutral_site"].astype(int)
 
-    # Block 2: possession control
     out["tor_diff"] = out["home_tor"] - out["away_tor"]
     out["tord_diff"] = out["home_tord"] - out["away_tord"]
     out["orb_diff"] = out["home_orb"] - out["away_orb"]
     out["drb_diff"] = out["home_drb"] - out["away_drb"]
 
-    # Block 1: tempo diffs / averages
     out["adj_tempo_diff"] = out["home_adj_tempo"] - out["away_adj_tempo"]
     out["adj_tempo_avg"] = (out["home_adj_tempo"] + out["away_adj_tempo"]) / 2.0
     out["tempo_avg"] = out["adj_tempo_avg"]
 
-    # Block 3: shot profile / variance proxies
     out["three_pt_rate_diff"] = out["home_three_pt_rate"] - out["away_three_pt_rate"]
     out["three_pt_pct_diff"] = out["home_three_pt_pct"] - out["away_three_pt_pct"]
     out["two_pt_pct_diff"] = out["home_two_pt_pct"] - out["away_two_pt_pct"]
@@ -93,7 +80,6 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out["var_proxy_tempo_3pr"] = out["three_pt_rate_avg"] * out["adj_tempo_avg"]
     out["var_proxy_3pr_1m3pp"] = out["three_pt_rate_avg"] * (1.0 - out["three_pt_pct_avg"] / 100.0)
 
-    # Block 5: imbalance / asymmetry magnitudes
     out["abs_adj_o_diff"] = out["adj_o_diff"].abs()
     out["abs_adj_d_diff"] = out["adj_d_diff"].abs()
     out["abs_efg_diff"] = out["efg_diff"].abs()
@@ -101,11 +87,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out["od_imbalance_away"] = (out["away_adj_o"] - out["away_adj_d"]).abs()
     out["imbalance_diff"] = out["od_imbalance_home"] - out["od_imbalance_away"]
 
-    # Block 6: strength tier / gating
     out["barthag_avg"] = (out["home_barthag"] + out["away_barthag"]) / 2.0
     out["wab_avg"] = (out["home_wab"] + out["away_wab"]) / 2.0
 
-    # Block 7: rest/congestion asymmetry
     out["home_days_since_last_game"] = pd.to_numeric(out["home_days_since_last_game"], errors="coerce")
     out["away_days_since_last_game"] = pd.to_numeric(out["away_days_since_last_game"], errors="coerce")
     out["home_games_last_7_days"] = pd.to_numeric(out["home_games_last_7_days"], errors="coerce")
@@ -133,13 +117,7 @@ def overwrite_rest_from_schedule(
     schedule_games: pd.DataFrame,
     update_mask: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
-    """
-    Overwrite rest/congestion fields from known schedule history.
-
-    For each selected row (via update_mask), compute:
-    - days_since_last_game: days since most recent prior game (< game_date), default 1
-    - games_last_7_days: count in [game_date - 7, game_date), default 1
-    """
+    """Overwrite rest/congestion fields from schedule history."""
     out = target_games.copy()
     if update_mask is None:
         update_mask = pd.Series(True, index=out.index)
@@ -262,7 +240,7 @@ def dampen_spread_predictions(
 
 def main():
     acc_teams, torvik, all_games = load_data()
-    _ = acc_teams  # kept for parity/context
+    _ = acc_teams
 
     torvik_ids = set(torvik["team_id"].astype(int).tolist())
     games = all_games.copy()
@@ -294,7 +272,6 @@ def main():
     merged = merge_torvik_asof(games, torvik, source_stats)
     merged = add_features(merged)
 
-    # Main XGBoost setup: ridge baseline signal + block 5 only.
     base_xgb_features = [
         "ridge_pred_spread",
         "abs_adj_o_diff",
@@ -314,18 +291,14 @@ def main():
     train_mask = model_df["date_dt"] <= cutoff_date
     test_mask = model_df["date_dt"] > cutoff_date
 
-    # Freeze post-cutoff Torvik stats and rebuild derived features.
     model_df = apply_fixed_cutoff_snapshot(model_df, torvik, cutoff_date, source_stats)
-    # Recompute post-cutoff rest stats from known schedule instead of frozen Torvik snapshot.
     schedule_df = games[["date", "home_team_id", "away_team_id"]].copy()
     schedule_df["date_dt"] = pd.to_datetime(schedule_df["date"], errors="coerce")
     model_df = overwrite_rest_from_schedule(model_df, schedule_df, update_mask=test_mask)
     model_df = add_features(model_df)
 
-    # Ridge prediction feature (baseline signal).
     model_df = build_ridge_baseline_feature(model_df, train_mask, test_mask)
 
-    # Final feature set.
     xgb_features = base_xgb_features
     model_df = model_df.dropna(subset=["margin"] + xgb_features).copy()
     model_df = model_df.sort_values("date_dt").reset_index(drop=True)
@@ -337,7 +310,6 @@ def main():
     X_test = model_df.loc[test_mask, xgb_features].values
     y_test = model_df.loc[test_mask, "margin"].values
 
-    # Chronological validation slice for early stopping.
     train_n = len(X_train)
     val_n = max(200, int(train_n * 0.15))
     val_n = min(val_n, train_n - 50)
@@ -370,7 +342,6 @@ def main():
             verbose=False,
         )
     except TypeError:
-        # Fallback for older/newer sklearn wrappers with changed fit signatures.
         xgb.fit(
             X_tr,
             y_tr,
@@ -379,9 +350,6 @@ def main():
             verbose=False,
         )
 
-    # Manual early stopping style using staged prediction history
-    # (compatible across xgboost versions lacking sklearn early_stopping_rounds in fit kwargs).
-    # If best_iteration exists, use it; else fallback to full model.
     best_iter = getattr(xgb, "best_iteration", None)
     if best_iter is not None:
         y_test_pred = xgb.predict(X_test, iteration_range=(0, best_iter + 1))

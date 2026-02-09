@@ -1,23 +1,4 @@
-
-"""
-Leak-proof prediction intervals using bucketed residual scale + greedy width allocation.
-
-Algorithm:
-1. Train point model (main XGBoost setup) with fixed-cutoff leakage controls.
-2. Build bucketed residual profiles from calibration residuals:
-   - Spread bins: |mu| < 5, 5-12, 12-20, 20+
-   - Tempo regime: below/above median tempo
-   - Optional imbalance regime: below/above median |imbalance_diff| (only if enough samples)
-3. Baseline widths: w_base = c * s_bucket, where s_bucket = median(|residual|).
-4. Calibrate c on held-out calibration tail to land around 72-73% baseline coverage.
-5. Greedy allocate +1 width points to games with highest expected marginal coverage gain,
-   using per-bucket empirical CDF F_b(|r| <= t), until expected coverage target is met.
-
-Usage:
-    python prediction_intervals.py
-    python prediction_intervals.py --predict-future
-    python prediction_intervals.py --target-coverage 0.74
-"""
+"""Build fixed-cutoff spread prediction intervals and optional future-game forecasts."""
 
 import argparse
 import heapq
@@ -355,13 +336,7 @@ def overwrite_rest_from_schedule(
     target_games: pd.DataFrame,
     schedule_games: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Overwrite rest/congestion fields using known schedule dates.
-
-    For each (team, game_date) in target_games:
-    - days_since_last_game: days since most recent prior game (< game_date), default 1.
-    - games_last_7_days: count of games in [game_date-7, game_date), default 1.
-    """
+    """Overwrite rest/congestion fields using known schedule dates."""
     out = target_games.copy()
 
     sched = schedule_games[["date_dt", "home_team_id", "away_team_id"]].copy()
@@ -523,8 +498,6 @@ def spread_bucket_index(abs_mu: np.ndarray) -> np.ndarray:
 
 
 def audit_spread_bucket_index(abs_mu: np.ndarray) -> np.ndarray:
-    # Buckets used for reporting/tactical calibration:
-    # 0:<5, 1:5-12, 2:12-20, 3:20+
     out = np.zeros(len(abs_mu), dtype=int)
     out[(abs_mu >= 5.0) & (abs_mu < 12.0)] = 1
     out[(abs_mu >= 12.0) & (abs_mu < 20.0)] = 2
@@ -1032,7 +1005,6 @@ def fit_bucket_allocator(
         max_cdf_t=MAX_CDF_T,
     )
 
-    # Hybrid part 1: feature-based residual-scale model (old workflow logic).
     tempo_cut = tempo_median
     X_fit_u = build_uncertainty_matrix(fit_df, mu_fit, tempo_cut)
     X_tune_u = build_uncertainty_matrix(tune_df, mu_tune, tempo_cut)
@@ -1074,7 +1046,6 @@ def fit_bucket_allocator(
     )
 
     tune_profiles = map_profiles_for_rows(tune_df, mu_tune, temp_allocator)
-    # Hybrid part 2: use bucket logic for greedy ROI allocation.
     base_c, base_cov_tune, base_aiw_tune = choose_base_multiplier(
         mu=mu_tune,
         y_true=y_tune,
@@ -1086,7 +1057,6 @@ def fit_bucket_allocator(
     )
     base_w_tune = np.clip(raw_hw_tune * base_c, 0.5, WIDTH_CAP)
 
-    # Keep expected greedy target tightly centered around the true target (74%).
     et_low = max(0.70, target_coverage - 0.008)
     et_high = min(0.76, target_coverage + 0.002)
     candidates = np.round(np.arange(et_low, et_high + 1e-9, 0.001), 3)
@@ -1123,7 +1093,6 @@ def fit_bucket_allocator(
     assert best_tuple is not None
     best_expected_target, greedy_cov_tune, greedy_aiw_tune, greedy_added_tune, greedy_score = best_tuple
 
-    # Final scalar calibration on tune tail: smallest overshoot at/above target.
     w_greedy_tune, _, _ = greedy_allocate_width(
         base_widths=base_w_tune,
         profiles=tune_profiles,
@@ -1159,7 +1128,6 @@ def fit_bucket_allocator(
             best_mult_aiw = aiw_m
             best_mult_score = score_m
 
-    # Validation-backed targeted post-adjustments (spread bucket + tempo regime).
     w_cal = np.clip(w_greedy_tune * best_mult, 0.5, WIDTH_CAP)
     abs_mu_tune = np.abs(mu_tune)
     spread4 = audit_spread_bucket_index(abs_mu_tune)
@@ -1200,7 +1168,6 @@ def fit_bucket_allocator(
                             if cov_all < target_coverage:
                                 continue
 
-                            # Guardrails for weak regimes (only when sample size is decent).
                             ok = True
                             for b in range(4):
                                 mb = spread4 == b
@@ -1217,7 +1184,6 @@ def fit_bucket_allocator(
                             if not ok:
                                 continue
 
-                            # Keep close games strong.
                             m_close = spread4 == 0
                             if int(m_close.sum()) >= 50:
                                 cov_close, _ = coverage_aiw_from_mu_width(
@@ -1229,7 +1195,6 @@ def fit_bucket_allocator(
                                 if cov_close < 0.75:
                                     continue
 
-                            # Prevent tempo under-coverage imbalance.
                             if int(high_tempo_mask.sum()) >= 50:
                                 cov_high, _ = coverage_aiw_from_mu_width(
                                     mu=mu_tune[high_tempo_mask],
@@ -1293,15 +1258,11 @@ def fit_bucket_allocator(
     else:
         post_score, post_aiw_tune, _, spread_post, low_post, high_post, post_cov_tune, post_cov_low, post_cov_high = best_post
 
-    # Audit-informed guards: protect close games and 12-20 regime.
     spread_post = spread_post.copy()
-    spread_post[0] = max(spread_post[0], 1.01)  # |mu| < 5
-    spread_post[2] = max(spread_post[2], 1.06)  # 12 <= |mu| < 20
-
-    # Small manual trim for the band below blowouts (12-20).
+    spread_post[0] = max(spread_post[0], 1.01)
+    spread_post[2] = max(spread_post[2], 1.06)
     pre_blowout_mult = 1.00
 
-    # Optional blowout cap tuning to trim AIW and move coverage closer to target.
     w_post = w_cal * spread_post[spread4]
     mid_mask = spread4 == 2
     w_post[mid_mask] *= pre_blowout_mult
@@ -1309,7 +1270,7 @@ def fit_bucket_allocator(
     w_post[high_tempo_mask] *= high_post
     w_post = np.clip(w_post, 0.5, WIDTH_CAP)
 
-    blow_mask = spread4 == 3  # audit bucket >=20
+    blow_mask = spread4 == 3
     blowout_candidates: List[Optional[float]] = [None, 29.0, 28.0]
     best_cap = None
     best_cap_cov, best_cap_aiw, _, best_cap_score = fold_calibration_score(
@@ -1449,7 +1410,6 @@ def predict_half_widths(
         min_delta=MIN_DELTA,
     )
     final_w = np.clip(final_w * allocator.calibration_mult, 0.5, allocator.width_cap)
-    # Post calibration: targeted spread/tempo factors chosen on validation.
     abs_mu = np.abs(np.asarray(mu, dtype=float))
     spread4 = audit_spread_bucket_index(abs_mu)
     final_w = final_w * allocator.spread_post_multipliers[spread4]

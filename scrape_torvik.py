@@ -1,11 +1,4 @@
-"""
-Scrape Bart Torvik ratings for all teams by game date.
-Uses Playwright for browser automation to bypass Cloudflare.
-
-Outputs:
-- data/torvik_asof_ratings_all_teams.csv: all scraped rows with mapping status
-- data/torvik_unmapped_teams.csv: unique unmapped/ambiguous team names for manual mapping
-"""
+"""Scrape daily Bart Torvik team ratings and map them to ESPN team IDs."""
 
 import csv
 import json
@@ -27,8 +20,7 @@ TEAMS_URL = (
     "basketball/mens-college-basketball/teams?limit=500"
 )
 
-# Torvik aliases that are usually ambiguous or not direct ESPN short names.
-# These overrides are only used before dynamic matching.
+# Manual overrides for ambiguous Torvik team names.
 TORVIK_TEAM_ID_OVERRIDES = {
     "Albany": "399",
     "Appalachian St.": "2026",
@@ -72,17 +64,14 @@ def get_unique_dates(games_path: str) -> list[str]:
 
 
 def current_season_year(today: date | None = None) -> int:
-    """Return the current CBB season year (e.g., Jan 2026 -> 2026, Nov 2026 -> 2027)."""
+    """Return the current CBB season year."""
     if today is None:
         today = datetime.today().date()
     return today.year + 1 if today.month >= 10 else today.year
 
 
 def generate_season_dates(season_year: int, end_date: date) -> list[str]:
-    """
-    Generate daily YYYY-MM-DD dates from season start (Nov 1 of prior year)
-    through end_date inclusive.
-    """
+    """Generate daily YYYY-MM-DD dates from season start through end_date."""
     start_date = date(season_year - 1, 11, 1)
     if end_date < start_date:
         return []
@@ -139,7 +128,6 @@ def normalize_team_name(name: str) -> str:
     value = re.sub(r"\s+", " ", value)
     value = re.sub(r"[^a-z0-9 ]", "", value)
     value = re.sub(r"\s+", " ", value)
-    # Collapse split initialisms ("n c state" -> "nc state").
     while True:
         collapsed = re.sub(r"\b([a-z])\s+([a-z])\b", r"\1\2", value)
         if collapsed == value:
@@ -156,11 +144,9 @@ def generate_name_variants(name: str) -> set[str]:
 
     variants = {base}
 
-    # Common article variation.
     if base.startswith("the "):
         variants.add(base[4:])
 
-    # Common Saint/State abbreviation variation.
     variants.add(re.sub(r"\bst\b", "state", base))
     variants.add(re.sub(r"\bstate\b", "st", base))
     variants.add(re.sub(r"\bst\b", "saint", base))
@@ -201,7 +187,6 @@ def fetch_all_espn_teams() -> dict[str, dict]:
     if teams_by_id:
         return teams_by_id
 
-    # Fallback to groups endpoint if team list endpoint fails.
     with urllib.request.urlopen(GROUPS_URL, timeout=20) as response:
         data = json.load(response)
 
