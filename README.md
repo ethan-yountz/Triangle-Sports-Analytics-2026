@@ -1,4 +1,4 @@
-## Triangle Sports Analytics 2026 🏀
+## Triangle Sports Analytics 2026 
 
 Repository for my submission to the Triangle Sports Analytics
 college basketball modeling competition.
