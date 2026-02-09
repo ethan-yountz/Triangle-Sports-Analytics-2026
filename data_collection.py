@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import re
+import argparse
 import urllib.error
 import urllib.request
 
@@ -11,6 +12,10 @@ import urllib.request
 GROUPS_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/"
     "basketball/mens-college-basketball/groups"
+)
+TEAMS_URL = (
+    "https://site.api.espn.com/apis/site/v2/sports/"
+    "basketball/mens-college-basketball/teams?limit=500"
 )
 TEAM_SCHEDULE_URL = (
     "https://site.api.espn.com/apis/site/v2/sports/"
@@ -28,6 +33,31 @@ ODDS_URL = (
 ESPN_BET_PROVIDER_IDS = {"58", "59"}
 DRAFTKINGS_PROVIDER_IDS = {"100"}
 REQUEST_TIMEOUT_SECONDS = 10
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Collect ACC and all-games datasets from ESPN."
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="Inclusive cutoff date in YYYY-MM-DD for completed games.",
+    )
+    parser.add_argument(
+        "--skip-team-stats",
+        action="store_true",
+        help="Skip building data/acc_game_stats.csv.",
+    )
+    return parser.parse_args()
+
+
+def parse_cutoff_date(value):
+    if not value:
+        return None
+    return datetime.datetime.strptime(value, "%Y-%m-%d").date()
+
+
 def fetch_acc_teams():
     with urllib.request.urlopen(GROUPS_URL) as response:
         data = json.load(response)
@@ -42,6 +72,19 @@ def fetch_acc_teams():
         return []
 
     return walk(data.get("groups", []))
+
+
+def fetch_all_d1_teams():
+    with urllib.request.urlopen(TEAMS_URL, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        data = json.load(response)
+    teams = []
+    for sport in data.get("sports", []):
+        for league in sport.get("leagues", []):
+            for item in league.get("teams", []):
+                team = item.get("team", item)
+                if team.get("id"):
+                    teams.append(team)
+    return teams
 
 
 def write_acc_csv(teams, output_path):
@@ -78,6 +121,15 @@ def parse_event_date(event_date):
     if not event_date:
         return None
     return event_date.split("T", 1)[0]
+
+
+def parse_date(date_value):
+    if not date_value:
+        return None
+    try:
+        return datetime.datetime.strptime(date_value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def fetch_preferred_spread(event_id, competition_id):
@@ -123,7 +175,7 @@ def add_draftkings_spreads(games, max_workers=8):
                 game_by_event[event_id]["spread"] = spread
 
 
-def fetch_acc_games(teams, season_year):
+def fetch_games_for_teams(teams, season_year, end_date=None):
     games = {}
     for team in teams:
         team_id = team.get("id")
@@ -140,6 +192,10 @@ def fetch_acc_games(teams, season_year):
             status = competition.get("status", {}).get("type", {})
             if not status.get("completed"):
                 continue
+            event_date = parse_event_date(event.get("date"))
+            event_date_obj = parse_date(event_date)
+            if end_date and event_date_obj and event_date_obj > end_date:
+                continue
             competition_id = competition.get("id") or event_id
             competitors = competition.get("competitors", [])
             home = next((c for c in competitors if c.get("homeAway") == "home"), {})
@@ -151,7 +207,7 @@ def fetch_acc_games(teams, season_year):
                 neutral_site = None
             games[event_id] = {
                 "event_id": event_id,
-                "date": parse_event_date(event.get("date")),
+                "date": event_date,
                 "home_team_id": home.get("team", {}).get("id"),
                 "away_team_id": away.get("team", {}).get("id"),
                 "home_score": home_score,
@@ -166,6 +222,10 @@ def fetch_acc_games(teams, season_year):
                 "competition_id": competition_id,
             }
     return list(games.values())
+
+
+def fetch_acc_games(teams, season_year, end_date=None):
+    return fetch_games_for_teams(teams, season_year, end_date=end_date)
 
 
 def fetch_event_team_stats(event_id):
@@ -229,7 +289,7 @@ def write_team_stats_csv(rows, output_path):
             writer.writerow([row.get(header) for header in headers])
 
 
-def write_acc_games_csv(games, output_path):
+def write_games_csv(games, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
@@ -263,23 +323,36 @@ def write_acc_games_csv(games, output_path):
 
 
 def main():
+    args = parse_args()
+    end_date = parse_cutoff_date(args.end_date)
     teams = fetch_acc_teams()
     output_path = os.path.join("data", "acc_teams.csv")
     write_acc_csv(teams, output_path)
     print(f"Wrote {len(teams)} teams to {output_path}")
     season_year = current_season_year()
-    games = fetch_acc_games(teams, season_year)
+    games = fetch_acc_games(teams, season_year, end_date=end_date)
     add_draftkings_spreads(games)
     games_output_path = os.path.join("data", "acc_games.csv")
-    write_acc_games_csv(games, games_output_path)
+    write_games_csv(games, games_output_path)
     print(
         f"Wrote {len(games)} ACC games for season {season_year} to {games_output_path}"
     )
-    team_stats = collect_team_stats([game["event_id"] for game in games])
-    team_stats = add_game_dates_to_team_stats(team_stats, games)
-    team_stats_output = os.path.join("data", "acc_game_stats.csv")
-    write_team_stats_csv(team_stats, team_stats_output)
-    print(f"Wrote {len(team_stats)} team stat rows to {team_stats_output}")
+
+    all_teams = fetch_all_d1_teams()
+    all_games = fetch_games_for_teams(all_teams, season_year, end_date=end_date)
+    add_draftkings_spreads(all_games)
+    all_games_output = os.path.join("data", "all_games.csv")
+    write_games_csv(all_games, all_games_output)
+    print(
+        f"Wrote {len(all_games)} total D1 games for season {season_year} to {all_games_output}"
+    )
+
+    if not args.skip_team_stats:
+        team_stats = collect_team_stats([game["event_id"] for game in games])
+        team_stats = add_game_dates_to_team_stats(team_stats, games)
+        team_stats_output = os.path.join("data", "acc_game_stats.csv")
+        write_team_stats_csv(team_stats, team_stats_output)
+        print(f"Wrote {len(team_stats)} team stat rows to {team_stats_output}")
 
 
 if __name__ == "__main__":
