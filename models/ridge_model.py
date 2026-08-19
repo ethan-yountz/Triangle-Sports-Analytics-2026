@@ -190,7 +190,6 @@ def build_final_feature_list() -> List[str]:
 
 
 RIDGE_FINAL_FEATURES = build_final_feature_list()
-# Keep legacy name wired to the final ridge production feature set.
 BASE_FEATURES = list(RIDGE_FINAL_FEATURES)
 
 ALPHA_GRID = np.logspace(-3, 3, 50)
@@ -1203,7 +1202,7 @@ def main() -> None:
             f"test [{fold.test_start.date()}, {fold.test_end.date()})"
         )
 
-    print("\nFeature blocks (edit FEATURE_BLOCKS to your preferred definitions):")
+    print("\nFeature blocks:")
     for block_name, feats in FEATURE_BLOCKS:
         print(f"{block_name}: {', '.join(feats)}")
 

@@ -287,7 +287,6 @@ def main() -> None:
         VEGAS_BLEND_W * out.loc[use_vegas, "pred_xgb_miya_blend"]
         + (1.0 - VEGAS_BLEND_W) * out.loc[use_vegas, "vegas_pred"]
     )
-    # Backward-compat alias for any downstream readers.
     out["pred_final_locked"] = out["pred_final_submission"]
 
     cols = [
@@ -326,12 +325,10 @@ def main() -> None:
     out[cols].to_csv(args.out_path, index=False)
 
     print("Final point submission blend complete.")
-    print("model_source: prediction_intervals.py + ridge_final_blocks_alpha_sweep")
     print(f"ridge_final_blocks: {FINAL_BLOCKS}")
     print(f"ridge_baseline_features: {FINAL_BASELINE_FEATURES}")
     print(f"ridge_n_features: {len(RIDGE_FINAL_FEATURES)}")
     print(f"ridge_best_alpha_from_sweep: {ridge_alpha:.6f}")
-    print(f"ridge_alpha_source: {FINAL_BLOCK_ALPHA_SWEEP_PATH}")
     print(f"miya_blend_w: {MIYA_BLEND_W:.2f}")
     print(f"vegas_blend_w: {VEGAS_BLEND_W:.2f}")
     print(f"xgb_intercept_shift: {XGB_INTERCEPT_SHIFT:.2f}")

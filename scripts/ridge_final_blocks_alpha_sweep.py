@@ -28,9 +28,8 @@ from models.ridge_model import (
 )
 
 
-# User-requested hardcoded setup.
 FINAL_BLOCKS = [6, 9, 10, 11]
-BASELINE_FEATURES = ["adj_o_diff", "adj_d_diff", "is_neutral"]  # offeff, defeff, is_neutral
+BASELINE_FEATURES = ["adj_o_diff", "adj_d_diff", "is_neutral"]
 MIN_TRAIN_ROWS = 50
 MIN_TEST_ROWS = 5
 
