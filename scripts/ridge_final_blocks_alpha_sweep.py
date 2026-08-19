@@ -1,5 +1,10 @@
 """Alpha sweep for fixed final block set, then all-fold model vs Vegas MAE."""
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import os
 from typing import Dict, List, Sequence, Tuple
 
@@ -11,7 +16,7 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from ridge_model import (
+from models.ridge_model import (
     ALPHA_GRID,
     FEATURE_BLOCKS,
     OUTER_FOLDS,

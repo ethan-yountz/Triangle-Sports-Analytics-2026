@@ -40,13 +40,21 @@ Widths come from **empirical residual CDFs** stratified by predicted spread, tem
 
 ## Repository
 
-| File | Role |
+```
+models/     ridge, XGBoost, and interval logic
+scripts/    data collection, evaluation, and submission runners
+data/       local CSVs (gitignored; scrape with scripts below)
+```
+
+| Path | Role |
 | --- | --- |
-| `data_collection.py` | ESPN schedules, scores, and closing lines |
-| `scrape_torvik.py` | Bart Torvik ratings mapped to ESPN team IDs |
-| `ridge_model.py` | Features, as-of joins, walk-forward ridge |
-| `xgboost_model.py` | Ridge → XGBoost residual model |
-| `prediction_intervals.py` | Interval backtest and forecasts |
-| `xgb_final_point_submission_run.py` | Fold-locked Miya/Vegas blend (`sync_evanmiya_priority.py`, `xgb_miya_blend_w_tune.py`) |
+| `scripts/data_collection.py` | ESPN schedules, scores, and closing lines |
+| `scripts/scrape_torvik.py` | Bart Torvik ratings mapped to ESPN team IDs |
+| `models/ridge_model.py` | Features, as-of joins, walk-forward ridge |
+| `models/xgboost_model.py` | Ridge → XGBoost residual model |
+| `models/prediction_intervals.py` | Interval backtest and forecasts |
+| `scripts/xgb_final_point_submission_run.py` | Fold-locked Miya/Vegas blend (`sync_evanmiya_priority.py`, `xgb_miya_blend_w_tune.py`) |
+
+Run from the repo root, e.g. `python scripts/data_collection.py`.
 
 **Stack:** Python, pandas, NumPy, scikit-learn, XGBoost.

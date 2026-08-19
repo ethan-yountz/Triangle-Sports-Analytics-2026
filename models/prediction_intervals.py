@@ -14,7 +14,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
-from ridge_model import RIDGE_FINAL_FEATURES
+from .ridge_model import RIDGE_FINAL_FEATURES
 
 
 TORVIK_PATH = os.path.join("data", "torvik_asof_ratings_all_teams.csv")

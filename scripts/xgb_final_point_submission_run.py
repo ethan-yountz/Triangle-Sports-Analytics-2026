@@ -1,5 +1,10 @@
 """Final point submission run using current ridge/XGB pipeline + locked blends."""
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import argparse
 import os
 from typing import List, Optional, Sequence, Tuple
@@ -11,7 +16,7 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from prediction_intervals import (
+from models.prediction_intervals import (
     PRE_XGB_REQUIRED,
     SOURCE_STATS,
     XGB_BASE_MARGIN_COL,
@@ -22,9 +27,9 @@ from prediction_intervals import (
     merge_torvik_asof,
     overwrite_rest_from_schedule,
 )
-from ridge_final_blocks_alpha_sweep import BASELINE_FEATURES as FINAL_BASELINE_FEATURES
-from ridge_final_blocks_alpha_sweep import FINAL_BLOCKS, build_final_feature_list
-from ridge_model import add_engineered_features, calculate_rest_days
+from models.ridge_model import add_engineered_features, calculate_rest_days
+from scripts.ridge_final_blocks_alpha_sweep import BASELINE_FEATURES as FINAL_BASELINE_FEATURES
+from scripts.ridge_final_blocks_alpha_sweep import FINAL_BLOCKS, build_final_feature_list
 
 
 MIYA_BLEND_W = 0.70

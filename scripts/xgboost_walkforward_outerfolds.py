@@ -1,5 +1,10 @@
 """Walk-forward XGBoost evaluation on OUTER_FOLDS with snapshot locking."""
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import os
 from typing import Dict, List
 
@@ -11,7 +16,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
-from ridge_model import (
+from models.ridge_model import (
     OUTER_FOLDS,
     RIDGE_FINAL_FEATURES,
     SNAPSHOT_STATS,
