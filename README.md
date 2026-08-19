@@ -13,7 +13,7 @@ Official standings: [winners](https://triangle-sports.github.io/winners.html) ·
 
 ## Approach
 
-The pipeline is a **ridge regression baseline** with a **shallow XGBoost residual correction**, trained on Division I games and applied to ACC matchups. Team ratings are joined **as of the day before the game**, and later games are scored from a **frozen snapshot** so nothing after the submission cutoff leaks into features.
+The pipeline is a **ridge regression baseline** with a **shallow XGBoost residual correction**, trained on Division I games and applied to ACC matchups.
 
 ### Features (no leakage)
 
@@ -32,8 +32,6 @@ Ratings are merged on `as_of_date = game_date - 1 day`. Walk-forward folds freez
 2. **XGBoost** is fit with the ridge prediction as `base_margin`, so the trees learn the residual rather than the full spread. The booster is heavily regularized (`max_depth=2`, large `min_child_weight` / `reg_lambda`) to avoid chasing noise in a short season.
 3. **Locked market shrink (optional).** If a projection or close exists, the submitted point is a blend with weights chosen on earlier walk-forward folds, not on contest games: 70% model / 30% EvanMiya, then 50/50 with the ESPN close. If either source is missing, the pipeline falls back to the unblended ridge+XGB prediction.
 
-Outer evaluation uses expanding, time-ordered weekly folds (not random CV). The blend is a post-process on top of that model, not a replacement for it.
-
 ### Prediction intervals
 
 Competition scoring: intervals are **disqualified below 70% coverage**; among valid entries, rank by average width (PIW).
@@ -42,24 +40,13 @@ Widths come from **empirical residual CDFs** stratified by predicted spread, tem
 
 ## Repository
 
-Modeling stack:
-
 | File | Role |
 | --- | --- |
-| `data_collection.py` | ESPN D1 schedules, scores, and closing lines |
-| `scrape_torvik.py` | Daily Bart Torvik ratings mapped to ESPN team IDs |
-| `ridge_model.py` | Feature blocks, as-of joins, snapshot locking, walk-forward ridge |
-| `ridge_final_blocks_alpha_sweep.py` | Final ridge feature set and `alpha` selection |
+| `data_collection.py` | ESPN schedules, scores, and closing lines |
+| `scrape_torvik.py` | Bart Torvik ratings mapped to ESPN team IDs |
+| `ridge_model.py` | Features, as-of joins, walk-forward ridge |
 | `xgboost_model.py` | Ridge → XGBoost residual model |
-| `xgboost_walkforward_outerfolds.py` | Walk-forward XGB evaluation / out-of-fold predictions |
-| `prediction_intervals.py` | Interval backtest and future-game interval forecasts |
-
-Locked market blend (post-process on the model above):
-
-| File | Role |
-| --- | --- |
-| `sync_evanmiya_priority.py` | Join EvanMiya projections onto game tables |
-| `xgb_miya_blend_w_tune.py` | Lock the model–projection blend weight on earlier folds |
-| `xgb_final_point_submission_run.py` | Apply the locked Miya / Vegas blends for submission |
+| `prediction_intervals.py` | Interval backtest and forecasts |
+| `xgb_final_point_submission_run.py` | Fold-locked Miya/Vegas blend (`sync_evanmiya_priority.py`, `xgb_miya_blend_w_tune.py`) |
 
 **Stack:** Python, pandas, NumPy, scikit-learn, XGBoost.
