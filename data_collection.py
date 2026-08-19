@@ -7,6 +7,7 @@ import re
 import argparse
 import urllib.error
 import urllib.request
+from zoneinfo import ZoneInfo
 
 
 GROUPS_URL = (
@@ -33,6 +34,7 @@ ODDS_URL = (
 ESPN_BET_PROVIDER_IDS = {"58", "59"}
 DRAFTKINGS_PROVIDER_IDS = {"100"}
 REQUEST_TIMEOUT_SECONDS = 10
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 def parse_args():
@@ -120,7 +122,11 @@ def parse_score(score_value):
 def parse_event_date(event_date):
     if not event_date:
         return None
-    return event_date.split("T", 1)[0]
+    try:
+        dt = datetime.datetime.fromisoformat(event_date.replace("Z", "+00:00"))
+        return dt.astimezone(EASTERN_TZ).date().isoformat()
+    except ValueError:
+        return event_date.split("T", 1)[0]
 
 
 def parse_date(date_value):

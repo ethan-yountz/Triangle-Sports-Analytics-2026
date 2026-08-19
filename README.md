@@ -1,16 +1,89 @@
-## Triangle Sports Analytics 2026 
+# NCAA Basketball Point Spreads — Triangle Sports Analytics 2026
 
-Repository for my submission to the Triangle Sports Analytics
-college basketball modeling competition.
+Winning solo entry (**devig to ball knowledge**, UNC) in the [2026 Triangle Sports Analytics competition](https://triangle-sports.github.io/): **1st place in point spreads** and **1st place in prediction intervals** out of 41 student teams from UNC, Duke, and NC State.
 
-### Overview
-This project focuses on predicting college basketball point
-spreads and constructing calibrated outcome prediction intervals
-under competition constraints.
+The task was to forecast home-minus-away margins for 78 ACC men's basketball games (Feb 7–Mar 7, 2026) from a fixed pre-window cutoff, then attach intervals that stayed valid under a 70% coverage rule.
 
-### Approach
-- Trained regression-based models on historical game data
-- Incorporated market information (closing spreads) for
-  calibration and sanity checks
-- Evaluated performance using mean absolute error (MAE)
-  and prediction interval coverage
+| Track | Result | Score |
+| --- | --- | --- |
+| Point spreads | 1st / 41 | MAE **8.629** |
+| Prediction intervals | 1st | **70.51%** coverage, PIW **22.45** |
+
+Official standings: [winners](https://triangle-sports.github.io/winners.html) · [leaderboard](https://triangle-sports.github.io/)
+
+## Approach
+
+The pipeline is a **ridge regression baseline** with a **shallow XGBoost residual correction**, trained on Division I games and applied to ACC matchups. Team ratings are joined **as of the day before the game**, and later games are scored from a **frozen snapshot** so nothing after the submission cutoff leaks into features.
+
+```mermaid
+flowchart LR
+  ESPN[ESPN schedules and closing lines]
+  Torvik[Bart Torvik as-of efficiency]
+  Feat[Home-minus-away features]
+  Ridge[Ridge margin model]
+  XGB[XGBoost residual correction]
+  Out[Point spread and intervals]
+
+  ESPN --> Feat
+  Torvik --> Feat
+  Feat --> Ridge
+  Ridge --> XGB
+  XGB --> Out
+```
+
+### Features (no leakage)
+
+Public team-level efficiency and context, expressed as home/away differences:
+
+- Bart Torvik adjusted offense/defense, tempo, and related Four Factors-style stats
+- Rest and congestion from the full D1 schedule (days since last game, games in the last 7 days)
+- Free-throw rate / foul-pressure interactions
+- Neutral-site indicator
+
+The model does **not** take the closing line as a feature. ESPN closes and an independent EvanMiya projection are used only after the model is fit (see below).
+
+Ratings are merged on `as_of_date = game_date - 1 day`. Walk-forward folds freeze every team's snapshot at the last date before the test window, so “future” games cannot see in-window updates.
+
+### Point model
+
+1. **Ridge** on a small production feature set (efficiency diffs, tempo × efficiency, fatigue asymmetry, game tempo, free-throw leverage), with `StandardScaler` and `alpha` chosen by inner `TimeSeriesSplit`.
+2. **XGBoost** is fit with the ridge prediction as `base_margin`, so the trees learn the residual rather than the full spread. The booster is heavily regularized (`max_depth=2`, large `min_child_weight` / `reg_lambda`) to avoid chasing noise in a short season.
+3. **Locked market shrink (optional).** If a projection or close exists, the submitted point is a blend with weights chosen on earlier walk-forward folds, not on contest games: 70% model / 30% EvanMiya, then 50/50 with the ESPN close. If either source is missing, the pipeline falls back to the unblended ridge+XGB prediction.
+
+Outer evaluation uses expanding, time-ordered weekly folds (not random CV). The blend is a post-process on top of that model, not a replacement for it.
+
+### Prediction intervals
+
+Competition scoring: intervals are **disqualified below 70% coverage**; among valid entries, rank by average width (PIW).
+
+Widths come from **empirical residual CDFs** stratified by predicted spread, tempo, and offense–defense imbalance. A greedy allocator adds width where it buys the most coverage, then a calibration multiplier is tuned on a held-out time window to sit just above the 70% bar. Interval **centers** can follow the submitted point (including the locked blend); **widths** are still fit from model residuals.
+
+## Repository
+
+Modeling stack:
+
+| File | Role |
+| --- | --- |
+| `data_collection.py` | ESPN D1 schedules, scores, and closing lines |
+| `scrape_torvik.py` | Daily Bart Torvik ratings mapped to ESPN team IDs |
+| `ridge_model.py` | Feature blocks, as-of joins, snapshot locking, walk-forward ridge |
+| `ridge_final_blocks_alpha_sweep.py` | Final ridge feature set and `alpha` selection |
+| `xgboost_model.py` | Ridge → XGBoost residual model |
+| `xgboost_walkforward_outerfolds.py` | Walk-forward XGB evaluation / out-of-fold predictions |
+| `prediction_intervals.py` | Interval backtest and future-game interval forecasts |
+
+Locked market blend (post-process on the model above):
+
+| File | Role |
+| --- | --- |
+| `sync_evanmiya_priority.py` | Join EvanMiya projections onto game tables |
+| `xgb_miya_blend_w_tune.py` | Lock the model–projection blend weight on earlier folds |
+| `xgb_final_point_submission_run.py` | Apply the locked Miya / Vegas blends for submission |
+
+`data/` holds the scraped tables and submission CSVs. Intermediate sweep files are local experiment artifacts, not part of the method.
+
+**Stack:** Python, pandas, NumPy, scikit-learn, XGBoost.
+
+## Why this matches the result
+
+College basketball margins are noisy (~9 MAE even for a strong line). The ridge layer captures the stable efficiency/tempo/rest signal; XGBoost is only allowed to correct systematic leftovers. A small, fold-locked shrink toward market lines is applied only when those lines exist. Intervals are treated as a constrained optimization problem (coverage first, width second), which is what the PIW metric actually rewards.

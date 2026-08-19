@@ -11,12 +11,13 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
+from ridge_model import RIDGE_FINAL_FEATURES
+
 
 TORVIK_PATH = os.path.join("data", "torvik_asof_ratings_all_teams.csv")
 ALL_GAMES_PATH = os.path.join("data", "all_games.csv")
 ACC_TEAMS_PATH = os.path.join("data", "acc_teams.csv")
-BLOWOUT_DAMP_C = 11.0
-BLOWOUT_DAMP_ALPHA = 0.45
+TEST_START_DATE = pd.Timestamp("2026-02-01")
 
 
 def load_data():
@@ -69,11 +70,15 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out["adj_tempo_diff"] = out["home_adj_tempo"] - out["away_adj_tempo"]
     out["adj_tempo_avg"] = (out["home_adj_tempo"] + out["away_adj_tempo"]) / 2.0
     out["tempo_avg"] = out["adj_tempo_avg"]
+    out["tempo_x_adj_o_diff"] = out["adj_tempo_avg"] * out["adj_o_diff"]
+    out["tempo_x_adj_d_diff"] = out["adj_tempo_avg"] * out["adj_d_diff"]
+    out["tempo_x_efg_diff"] = out["adj_tempo_avg"] * out["efg_diff"]
 
     out["three_pt_rate_diff"] = out["home_three_pt_rate"] - out["away_three_pt_rate"]
     out["three_pt_pct_diff"] = out["home_three_pt_pct"] - out["away_three_pt_pct"]
     out["two_pt_pct_diff"] = out["home_two_pt_pct"] - out["away_two_pt_pct"]
     out["efgd_diff"] = out["home_efgd"] - out["away_efgd"]
+    out["tempo_x_efgd_diff"] = out["adj_tempo_avg"] * out["efgd_diff"]
 
     out["three_pt_rate_avg"] = (out["home_three_pt_rate"] + out["away_three_pt_rate"]) / 2.0
     out["three_pt_pct_avg"] = (out["home_three_pt_pct"] + out["away_three_pt_pct"]) / 2.0
@@ -108,6 +113,20 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         out["away_games_last_7_days"] / np.maximum(out["away_days_since_last_game"], 1.0)
     )
     out["fatigue_index_diff"] = out["home_fatigue_index"] - out["away_fatigue_index"]
+
+    out["home_ftr"] = pd.to_numeric(out["home_ftr"], errors="coerce")
+    out["away_ftr"] = pd.to_numeric(out["away_ftr"], errors="coerce")
+    out["home_ftrd"] = pd.to_numeric(out["home_ftrd"], errors="coerce")
+    out["away_ftrd"] = pd.to_numeric(out["away_ftrd"], errors="coerce")
+    out["ftr_diff"] = out["home_ftr"] - out["away_ftr"]
+    out["ftr_allowed_diff"] = out["home_ftrd"] - out["away_ftrd"]
+    out["home_foul_pressure"] = out["home_ftr"] - out["away_ftrd"]
+    out["away_foul_pressure"] = out["away_ftr"] - out["home_ftrd"]
+    out["foul_rate_diff"] = out["home_foul_pressure"] - out["away_foul_pressure"]
+    out["opponent_foul_rate_diff"] = out["away_ftrd"] - out["home_ftrd"]
+    out["close_spread_proxy"] = 1.0 / (1.0 + (out["adj_o_diff"] - out["adj_d_diff"]).abs())
+    out["ftr_x_close_spread"] = out["ftr_diff"] * out["close_spread_proxy"]
+    out["ftr_x_fatigue"] = out["ftr_diff"] * out["fatigue_index_diff"]
 
     return out
 
@@ -193,19 +212,7 @@ def build_ridge_baseline_feature(
     df: pd.DataFrame, train_mask: pd.Series, test_mask: pd.Series
 ) -> pd.DataFrame:
     out = df.copy()
-    ridge_feats = [
-        "adj_o_diff",
-        "adj_d_diff",
-        "efg_diff",
-        "is_neutral",
-        "tor_diff",
-        "tord_diff",
-        "orb_diff",
-        "drb_diff",
-        "days_since_last_game_diff",
-        "games_last_7_days_diff",
-        "fatigue_index_diff",
-    ]
+    ridge_feats = list(RIDGE_FINAL_FEATURES)
     out = out.dropna(subset=ridge_feats + ["margin"]).copy()
 
     X_train = out.loc[train_mask.loc[out.index], ridge_feats].values
@@ -226,16 +233,12 @@ def build_ridge_baseline_feature(
     return out
 
 
-def dampen_spread_predictions(
-    preds: np.ndarray,
-    c: float = BLOWOUT_DAMP_C,
-    alpha: float = BLOWOUT_DAMP_ALPHA,
-) -> np.ndarray:
-    """Compress very large spread magnitudes while preserving sign."""
-    preds = np.asarray(preds, dtype=float)
-    abs_pred = np.abs(preds)
-    damp_abs = np.minimum(abs_pred, c + alpha * abs_pred)
-    return np.sign(preds) * damp_abs
+def add_ridge_dependent_xgb_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    ftr = pd.to_numeric(out.get("ftr_diff"), errors="coerce")
+    ridge_base = np.abs(pd.to_numeric(out.get("ridge_pred_spread"), errors="coerce"))
+    out["ftr_x_ridge_pred"] = ftr * ridge_base
+    return out
 
 
 def main():
@@ -255,6 +258,8 @@ def main():
         "adj_d",
         "efg",
         "efgd",
+        "ftr",
+        "ftrd",
         "tor",
         "tord",
         "orb",
@@ -272,24 +277,14 @@ def main():
     merged = merge_torvik_asof(games, torvik, source_stats)
     merged = add_features(merged)
 
-    base_xgb_features = [
-        "ridge_pred_spread",
-        "abs_adj_o_diff",
-        "abs_adj_d_diff",
-        "abs_efg_diff",
-        "imbalance_diff",
-    ]
-    required = ["margin", "spread", "date", "home_team_id", "away_team_id"] + base_xgb_features
-
     model_df = merged.copy()
-    model_df["date_dt"] = pd.to_datetime(model_df["date"])
-    model_df = model_df.dropna(subset=[c for c in required if c in model_df.columns]).copy()
+    model_df["date_dt"] = pd.to_datetime(model_df["date"], errors="coerce")
+    model_df = model_df.dropna(subset=["date_dt", "margin"]).copy()
     model_df = model_df.sort_values("date_dt").reset_index(drop=True)
 
-    split_idx = int(len(model_df) * 0.8)
-    cutoff_date = model_df.loc[split_idx - 1, "date_dt"]
-    train_mask = model_df["date_dt"] <= cutoff_date
-    test_mask = model_df["date_dt"] > cutoff_date
+    cutoff_date = TEST_START_DATE - pd.Timedelta(days=1)
+    train_mask = model_df["date_dt"] < TEST_START_DATE
+    test_mask = model_df["date_dt"] >= TEST_START_DATE
 
     model_df = apply_fixed_cutoff_snapshot(model_df, torvik, cutoff_date, source_stats)
     schedule_df = games[["date", "home_team_id", "away_team_id"]].copy()
@@ -298,64 +293,87 @@ def main():
     model_df = add_features(model_df)
 
     model_df = build_ridge_baseline_feature(model_df, train_mask, test_mask)
+    model_df = add_ridge_dependent_xgb_features(model_df)
 
-    xgb_features = base_xgb_features
-    model_df = model_df.dropna(subset=["margin"] + xgb_features).copy()
+    xgb_features = [
+        "adj_o_diff",
+        "adj_d_diff",
+        "tempo_x_adj_o_diff",
+        "tempo_x_adj_d_diff",
+        "tempo_x_efg_diff",
+        "tempo_x_efgd_diff",
+        "days_since_last_game_diff",
+        "games_last_7_days_diff",
+        "fatigue_index_diff",
+        "adj_tempo_avg",
+        "ftr_diff",
+        "ftr_allowed_diff",
+        "foul_rate_diff",
+        "opponent_foul_rate_diff",
+        "ftr_x_ridge_pred",
+        "ftr_x_fatigue",
+    ]
+    model_df = model_df.dropna(subset=["margin", "ridge_pred_spread"] + xgb_features).copy()
     model_df = model_df.sort_values("date_dt").reset_index(drop=True)
-    train_mask = model_df["date_dt"] <= cutoff_date
-    test_mask = model_df["date_dt"] > cutoff_date
+    train_mask = model_df["date_dt"] < TEST_START_DATE
+    test_mask = model_df["date_dt"] >= TEST_START_DATE
 
     X_train = model_df.loc[train_mask, xgb_features].values
     y_train = model_df.loc[train_mask, "margin"].values
+    base_train = pd.to_numeric(model_df.loc[train_mask, "ridge_pred_spread"], errors="coerce").values
     X_test = model_df.loc[test_mask, xgb_features].values
     y_test = model_df.loc[test_mask, "margin"].values
+    base_test = pd.to_numeric(model_df.loc[test_mask, "ridge_pred_spread"], errors="coerce").values
 
     train_n = len(X_train)
     val_n = max(200, int(train_n * 0.15))
+    if val_n >= train_n:
+        val_n = max(20, train_n // 5)
     val_n = min(val_n, train_n - 50)
     tr_end = train_n - val_n
+    if tr_end < 50 or val_n < 10:
+        raise ValueError("Insufficient rows for XGB inner validation split.")
 
     X_tr, y_tr = X_train[:tr_end], y_train[:tr_end]
+    base_tr = base_train[:tr_end]
     X_val, y_val = X_train[tr_end:], y_train[tr_end:]
+    base_val = base_train[tr_end:]
 
-    xgb = XGBRegressor(
-        objective="reg:squarederror",
-        max_depth=3,
-        min_child_weight=8,
-        learning_rate=0.05,
-        n_estimators=400,
-        subsample=0.7,
-        colsample_bytree=0.7,
-        gamma=0.0,
+    base_params = dict(
+        objective="reg:pseudohubererror",
+        max_depth=2,
+        min_child_weight=80,
+        learning_rate=0.02,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        gamma=0.25,
         reg_alpha=0.0,
-        reg_lambda=1.0,
+        reg_lambda=120.0,
         random_state=42,
+        eval_metric="mae",
+    )
+    xgb_early = XGBRegressor(
+        **base_params,
+        n_estimators=4000,
+        early_stopping_rounds=200,
+    )
+    xgb_early.fit(
+        X_tr,
+        y_tr,
+        base_margin=base_tr,
+        eval_set=[(X_val, y_val)],
+        base_margin_eval_set=[base_val],
+        verbose=False,
     )
 
-    try:
-        xgb.fit(
-            X_tr,
-            y_tr,
-            eval_set=[(X_val, y_val)],
-            eval_metric="mae",
-            early_stopping_rounds=30,
-            verbose=False,
-        )
-    except TypeError:
-        xgb.fit(
-            X_tr,
-            y_tr,
-            eval_set=[(X_val, y_val)],
-            eval_metric="mae",
-            verbose=False,
-        )
-
-    best_iter = getattr(xgb, "best_iteration", None)
-    if best_iter is not None:
-        y_test_pred = xgb.predict(X_test, iteration_range=(0, best_iter + 1))
-    else:
-        y_test_pred = xgb.predict(X_test)
-    y_test_pred = dampen_spread_predictions(y_test_pred)
+    best_iter_raw = getattr(xgb_early, "best_iteration", None)
+    best_iter = int(best_iter_raw) if best_iter_raw is not None else 3999
+    xgb = XGBRegressor(
+        **base_params,
+        n_estimators=best_iter + 1,
+    )
+    xgb.fit(X_train, y_train, base_margin=base_train, verbose=False)
+    y_test_pred = xgb.predict(X_test, base_margin=base_test)
 
     test_df = model_df.loc[test_mask].copy().reset_index(drop=True)
     test_df["pred_xgb"] = y_test_pred
@@ -380,7 +398,6 @@ def main():
     print(f"features: {xgb_features}")
     print(f"val_n_for_early_stopping: {val_n}")
     print(f"best_iteration: {best_iter if best_iter is not None else 'full_model'}")
-    print(f"blowout_dampening: c={BLOWOUT_DAMP_C:.2f}, alpha={BLOWOUT_DAMP_ALPHA:.2f}")
     print(f"test_mae: {test_mae:.3f}")
     print(f"test_rmse: {test_rmse:.3f}")
     print(f"vegas_test_mae: {vegas_mae:.3f}")

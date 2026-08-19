@@ -14,16 +14,30 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
+from ridge_model import RIDGE_FINAL_FEATURES
+
 
 TORVIK_PATH = os.path.join("data", "torvik_asof_ratings_all_teams.csv")
 ALL_GAMES_PATH = os.path.join("data", "all_games.csv")
 FUTURE_GAMES_PATH = os.path.join("data", "future_acc_games.csv")
 OUTPUT_PATH = os.path.join("data", "predictions_with_intervals.csv")
+POINT_CENTER_PATH = os.path.join("data", "xgb_future_acc_predictions_blend_w065.csv")
+POINT_CENTER_COL_CANDIDATES = (
+    "pred_final_submission",
+    "pt_spread",
+    "pred_final_locked",
+)
 
 SOURCE_STATS = [
     "adj_o",
     "adj_d",
     "efg",
+    "efgd",
+    "ftr",
+    "ftrd",
+    "wab",
+    "recent_luck_trend",
+    "recent_form",
     "tor",
     "tord",
     "orb",
@@ -35,35 +49,44 @@ SOURCE_STATS = [
     "games_last_7_days",
 ]
 
-RIDGE_FEATURES = [
+RIDGE_FEATURES = list(RIDGE_FINAL_FEATURES)
+
+XGB_BASE_MARGIN_COL = "ridge_pred_spread"
+XGB_POINT_FEATURES = [
     "adj_o_diff",
     "adj_d_diff",
-    "efg_diff",
-    "is_neutral",
-    "tor_diff",
-    "tord_diff",
-    "orb_diff",
-    "drb_diff",
+    "tempo_x_adj_o_diff",
+    "tempo_x_adj_d_diff",
+    "tempo_x_efg_diff",
+    "tempo_x_efgd_diff",
     "days_since_last_game_diff",
     "games_last_7_days_diff",
     "fatigue_index_diff",
-]
-
-XGB_POINT_FEATURES = [
-    "ridge_pred_spread",
-    "abs_adj_o_diff",
-    "abs_adj_d_diff",
-    "abs_efg_diff",
-    "imbalance_diff",
+    "adj_tempo_avg",
+    "ftr_diff",
+    "ftr_allowed_diff",
+    "foul_rate_diff",
+    "opponent_foul_rate_diff",
+    "ftr_x_ridge_pred",
+    "ftr_x_fatigue",
 ]
 
 PRE_XGB_REQUIRED = [
-    "abs_adj_o_diff",
-    "abs_adj_d_diff",
-    "abs_efg_diff",
-    "imbalance_diff",
-    "tempo_avg",
-    "three_pt_rate_avg",
+    "adj_o_diff",
+    "adj_d_diff",
+    "tempo_x_adj_o_diff",
+    "tempo_x_adj_d_diff",
+    "tempo_x_efg_diff",
+    "tempo_x_efgd_diff",
+    "days_since_last_game_diff",
+    "games_last_7_days_diff",
+    "fatigue_index_diff",
+    "adj_tempo_avg",
+    "ftr_diff",
+    "ftr_allowed_diff",
+    "foul_rate_diff",
+    "opponent_foul_rate_diff",
+    "ftr_x_fatigue",
 ]
 
 SPREAD_BUCKETS = [
@@ -92,6 +115,7 @@ MIN_CALIB_FOLD_SIZE = 80
 USE_MULTI_CUTOFF_STABILITY = True
 MULTI_CUTOFF_FRACTIONS = [(0.40, 0.56), (0.46, 0.62), (0.52, 0.68)]
 MULTI_CUTOFF_MULT_GRID = np.arange(0.90, 1.101, 0.005)
+DEFAULT_TARGET_COVERAGE = 0.70
 
 
 @dataclass
@@ -140,6 +164,13 @@ def round_interval_bounds(lower: np.ndarray, upper: np.ndarray) -> Tuple[np.ndar
     """Submission-style integer bounds: ceil(lower), floor(upper)."""
     lb = np.ceil(np.asarray(lower, dtype=float))
     ub = np.floor(np.asarray(upper, dtype=float))
+
+    # Competition rounding override:
+    # lower: remap 0 and -1 to 1
+    # upper: remap 0 and 1 to -1
+    lb[(lb == 0.0) | (lb == -1.0)] = 1.0
+    ub[(ub == 0.0) | (ub == 1.0)] = -1.0
+
     bad = ub < lb
     if np.any(bad):
         ub[bad] = lb[bad]
@@ -223,6 +254,22 @@ def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     torvik["team_id"] = torvik["team_id"].astype(int)
     torvik["date_dt"] = pd.to_datetime(torvik["date"], errors="coerce")
     torvik = torvik.dropna(subset=["date_dt"]).copy()
+    if "adj_o" not in torvik.columns:
+        torvik["adj_o"] = 0.0
+    if "adj_d" not in torvik.columns:
+        torvik["adj_d"] = 0.0
+    if "wab" not in torvik.columns:
+        torvik["wab"] = 0.0
+
+    torvik["adj_o"] = pd.to_numeric(torvik["adj_o"], errors="coerce")
+    torvik["adj_d"] = pd.to_numeric(torvik["adj_d"], errors="coerce")
+    torvik["wab"] = pd.to_numeric(torvik["wab"], errors="coerce").fillna(0.0)
+    torvik["adj_net"] = torvik["adj_o"].fillna(0.0) - torvik["adj_d"].fillna(0.0)
+    torvik = torvik.sort_values(["team_id", "date_dt"]).reset_index(drop=True)
+    torvik["wab_lag7"] = torvik.groupby("team_id")["wab"].shift(7)
+    torvik["adj_net_lag7"] = torvik.groupby("team_id")["adj_net"].shift(7)
+    torvik["recent_luck_trend"] = (torvik["wab"] - torvik["wab_lag7"]).fillna(0.0)
+    torvik["recent_form"] = (torvik["adj_net"] - torvik["adj_net_lag7"]).fillna(0.0)
 
     for df in [all_games, future_games]:
         if len(df) == 0:
@@ -243,6 +290,58 @@ def load_data() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         future_games["home_team_id"].isin(mapped_ids) & future_games["away_team_id"].isin(mapped_ids)
     ].copy()
     return all_games, torvik, future_games
+
+
+def load_point_center_map(path: str = POINT_CENTER_PATH) -> Tuple[Dict[str, float], Optional[str]]:
+    """Load optional point-spread centers keyed by event_id."""
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}, None
+    if "event_id" not in df.columns:
+        return {}, None
+
+    center_col = next((c for c in POINT_CENTER_COL_CANDIDATES if c in df.columns), None)
+    if center_col is None:
+        return {}, None
+
+    work = df[["event_id", center_col]].copy()
+    work["event_id"] = work["event_id"].astype(str).str.strip()
+    work[center_col] = pd.to_numeric(work[center_col], errors="coerce")
+    work = work.dropna(subset=[center_col]).copy()
+    center_map = {
+        str(eid): float(val)
+        for eid, val in zip(work["event_id"], work[center_col])
+        if str(eid).strip() != ""
+    }
+    return center_map, center_col
+
+
+def override_future_centers_with_point_spread(
+    future_feat: pd.DataFrame,
+    mu: np.ndarray,
+    center_path: str = POINT_CENTER_PATH,
+) -> Tuple[np.ndarray, int, Optional[str]]:
+    """Override model centers with point-spread centers when available by event_id."""
+    out = np.asarray(mu, dtype=float).copy()
+    if "event_id" not in future_feat.columns:
+        return out, 0, None
+
+    center_map, center_col = load_point_center_map(center_path)
+    if len(center_map) == 0:
+        return out, 0, center_col
+
+    replaced = 0
+    event_ids = future_feat["event_id"].astype(str).str.strip().tolist()
+    for i, event_id in enumerate(event_ids):
+        val = center_map.get(event_id)
+        if val is None or not np.isfinite(val):
+            continue
+        out[i] = float(val)
+        replaced += 1
+    return out, replaced, center_col
 
 
 def _merge_side_asof(
@@ -298,10 +397,17 @@ def merge_torvik_asof(games: pd.DataFrame, torvik: pd.DataFrame, stat_cols: List
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    def col_or_zero(col_name: str) -> pd.Series:
+        if col_name in out.columns:
+            return pd.to_numeric(out[col_name], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=out.index, dtype=float)
 
     out["adj_o_diff"] = out["home_adj_o"] - out["away_adj_o"]
     out["adj_d_diff"] = out["home_adj_d"] - out["away_adj_d"]
     out["efg_diff"] = out["home_efg"] - out["away_efg"]
+    out["home_efgd"] = col_or_zero("home_efgd")
+    out["away_efgd"] = col_or_zero("away_efgd")
+    out["efgd_diff"] = out["home_efgd"] - out["away_efgd"]
     out["is_neutral"] = out["neutral_site"].astype(int)
 
     out["tor_diff"] = out["home_tor"] - out["away_tor"]
@@ -327,8 +433,42 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     out["od_imbalance_away"] = (out["away_adj_o"] - out["away_adj_d"]).abs()
     out["imbalance_diff"] = out["od_imbalance_home"] - out["od_imbalance_away"]
 
-    out["tempo_avg"] = (out["home_adj_tempo"] + out["away_adj_tempo"]) / 2.0
+    out["adj_tempo_avg"] = (out["home_adj_tempo"] + out["away_adj_tempo"]) / 2.0
+    out["tempo_avg"] = out["adj_tempo_avg"]
+    out["tempo_x_adj_o_diff"] = out["adj_tempo_avg"] * out["adj_o_diff"]
+    out["tempo_x_adj_d_diff"] = out["adj_tempo_avg"] * out["adj_d_diff"]
+    out["tempo_x_efg_diff"] = out["adj_tempo_avg"] * out["efg_diff"]
+    out["tempo_x_efgd_diff"] = out["adj_tempo_avg"] * out["efgd_diff"]
     out["three_pt_rate_avg"] = (out["home_three_pt_rate"] + out["away_three_pt_rate"]) / 2.0
+
+    # Luck/regression block features.
+    out["home_wab"] = col_or_zero("home_wab")
+    out["away_wab"] = col_or_zero("away_wab")
+    out["home_recent_luck_trend"] = col_or_zero("home_recent_luck_trend")
+    out["away_recent_luck_trend"] = col_or_zero("away_recent_luck_trend")
+    out["home_recent_form"] = col_or_zero("home_recent_form")
+    out["away_recent_form"] = col_or_zero("away_recent_form")
+
+    out["luck_diff"] = out["home_wab"] - out["away_wab"]
+    out["recent_luck_trend_diff"] = out["home_recent_luck_trend"] - out["away_recent_luck_trend"]
+    out["recent_form_diff"] = out["home_recent_form"] - out["away_recent_form"]
+    out["luck_x_recent_form"] = out["luck_diff"] * out["recent_form_diff"]
+    out["luck_reversion_term"] = -out["luck_diff"]
+    out["luck_x_tempo"] = out["luck_diff"] * out["tempo_avg"]
+
+    out["home_ftr"] = col_or_zero("home_ftr")
+    out["away_ftr"] = col_or_zero("away_ftr")
+    out["home_ftrd"] = col_or_zero("home_ftrd")
+    out["away_ftrd"] = col_or_zero("away_ftrd")
+    out["ftr_diff"] = out["home_ftr"] - out["away_ftr"]
+    out["ftr_allowed_diff"] = out["home_ftrd"] - out["away_ftrd"]
+    out["home_foul_pressure"] = out["home_ftr"] - out["away_ftrd"]
+    out["away_foul_pressure"] = out["away_ftr"] - out["home_ftrd"]
+    out["foul_rate_diff"] = out["home_foul_pressure"] - out["away_foul_pressure"]
+    out["opponent_foul_rate_diff"] = out["away_ftrd"] - out["home_ftrd"]
+    out["close_spread_proxy"] = 1.0 / (1.0 + (out["adj_o_diff"] - out["adj_d_diff"]).abs())
+    out["ftr_x_close_spread"] = out["ftr_diff"] * out["close_spread_proxy"]
+    out["ftr_x_fatigue"] = out["ftr_diff"] * out["fatigue_index_diff"]
     return out
 
 
@@ -368,16 +508,16 @@ def overwrite_rest_from_schedule(
         for side in ("home", "away"):
             team_id = int(row[f"{side}_team_id"])
             dates = team_dates.get(team_id, np.array([], dtype="datetime64[ns]"))
-            idx = int(np.searchsorted(dates, game_date, side="left"))
+            pos = int(np.searchsorted(dates, game_date, side="left"))
 
-            if idx == 0:
+            if pos == 0:
                 days = 1.0
             else:
-                days = float((game_date - dates[idx - 1]) / np.timedelta64(1, "D"))
+                days = float((game_date - dates[pos - 1]) / np.timedelta64(1, "D"))
 
             window_start = game_date - np.timedelta64(7, "D")
             lo = int(np.searchsorted(dates, window_start, side="left"))
-            games7 = float(idx - lo)
+            games7 = float(pos - lo)
             if games7 <= 0:
                 games7 = 1.0
 
@@ -444,36 +584,70 @@ def fit_ridge_baseline(df: pd.DataFrame, train_mask: pd.Series) -> Tuple[pd.Data
     return out, ridge, scaler
 
 
-def fit_xgb_point_model(X_train: np.ndarray, y_train: np.ndarray) -> XGBRegressor:
+def add_ridge_dependent_xgb_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    ftr = pd.to_numeric(out.get("ftr_diff"), errors="coerce")
+    ridge_base = np.abs(pd.to_numeric(out.get(XGB_BASE_MARGIN_COL), errors="coerce"))
+    out["ftr_x_ridge_pred"] = ftr * ridge_base
+    return out
+
+
+def fit_xgb_point_model(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    base_margin_train: np.ndarray,
+) -> XGBRegressor:
     n_train = len(X_train)
     val_size = max(100, int(0.2 * n_train))
     if val_size >= n_train:
         val_size = max(20, n_train // 5)
     fit_size = n_train - val_size
 
-    model = XGBRegressor(
-        objective="reg:squarederror",
-        max_depth=3,
-        min_child_weight=8,
-        learning_rate=0.05,
-        n_estimators=400,
-        subsample=0.7,
-        colsample_bytree=0.7,
-        gamma=0.0,
+    base_params = dict(
+        objective="reg:pseudohubererror",
+        max_depth=2,
+        min_child_weight=80,
+        learning_rate=0.02,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        gamma=0.25,
         reg_alpha=0.0,
-        reg_lambda=1.0,
+        reg_lambda=120.0,
         random_state=42,
-        n_jobs=4,
         eval_metric="mae",
-        early_stopping_rounds=30,
+        n_jobs=4,
+    )
+
+    model = XGBRegressor(
+        **base_params,
+        n_estimators=4000,
+        early_stopping_rounds=200,
     )
 
     X_fit = X_train[:fit_size]
     y_fit = y_train[:fit_size]
+    base_fit = base_margin_train[:fit_size]
     X_val = X_train[fit_size:]
     y_val = y_train[fit_size:]
-    model.fit(X_fit, y_fit, eval_set=[(X_val, y_val)], verbose=False)
-    return model
+    base_val = base_margin_train[fit_size:]
+    model.fit(
+        X_fit,
+        y_fit,
+        base_margin=base_fit,
+        eval_set=[(X_val, y_val)],
+        base_margin_eval_set=[base_val],
+        verbose=False,
+    )
+
+    best_iter_raw = getattr(model, "best_iteration", None)
+    best_iter = int(best_iter_raw) if best_iter_raw is not None else 3999
+
+    refit = XGBRegressor(
+        **base_params,
+        n_estimators=best_iter + 1,
+    )
+    refit.fit(X_train, y_train, base_margin=base_margin_train, verbose=False)
+    return refit
 
 
 def dampen_point_predictions(
@@ -902,7 +1076,8 @@ def build_split_artifacts(
         return None
 
     model_df, ridge_model, ridge_scaler = fit_ridge_baseline(model_df, train_mask)
-    model_df = model_df.dropna(subset=XGB_POINT_FEATURES).copy()
+    model_df = add_ridge_dependent_xgb_features(model_df)
+    model_df = model_df.dropna(subset=[XGB_BASE_MARGIN_COL] + XGB_POINT_FEATURES).copy()
     model_df = model_df.sort_values("date_dt").reset_index(drop=True)
 
     train_mask = model_df["date_dt"] <= train_cutoff_date
@@ -913,9 +1088,11 @@ def build_split_artifacts(
 
     X_train = model_df.loc[train_mask, XGB_POINT_FEATURES].values
     y_train = model_df.loc[train_mask, "margin"].values
-    xgb_model = fit_xgb_point_model(X_train, y_train)
+    base_train = pd.to_numeric(model_df.loc[train_mask, XGB_BASE_MARGIN_COL], errors="coerce").values
+    xgb_model = fit_xgb_point_model(X_train, y_train, base_train)
 
-    mu_all = dampen_point_predictions(xgb_model.predict(model_df[XGB_POINT_FEATURES].values))
+    base_all = pd.to_numeric(model_df[XGB_BASE_MARGIN_COL], errors="coerce").values
+    mu_all = xgb_model.predict(model_df[XGB_POINT_FEATURES].values, base_margin=base_all)
     model_df["mu"] = mu_all
 
     calib_df = model_df.loc[calib_mask].reset_index(drop=True)
@@ -1356,6 +1533,7 @@ def fit_bucket_allocator(
             "calibrated_aiw_tune": best_mult_aiw,
             "post_cov_tune": post_cov_tune,
             "post_aiw_tune": post_aiw_tune,
+            "post_piw_tune": post_aiw_tune,
             "post_cov_low_tempo": post_cov_low,
             "post_cov_high_tempo": post_cov_high,
             "post_cov_tune_blowout_cap": best_cap_cov,
@@ -1461,7 +1639,7 @@ def prepare_historical_frame(all_games: pd.DataFrame, torvik: pd.DataFrame) -> p
     return feat
 
 
-def run_backtest(target_coverage: float = 0.74) -> Dict[str, object]:
+def run_backtest(target_coverage: float = DEFAULT_TARGET_COVERAGE) -> Dict[str, object]:
     all_games, torvik, _ = load_data()
     base_hist_df = prepare_historical_frame(all_games, torvik)
 
@@ -1564,6 +1742,7 @@ def run_backtest(target_coverage: float = 0.74) -> Dict[str, object]:
         f"post_aiw={allocator.calibration_summary['post_aiw_tune']:.3f} "
         f"exp_target={allocator.expected_target:.3f} mult={allocator.calibration_mult:.2f}"
     )
+    print(f"calibration PIW (rounded post-calibration): {allocator.calibration_summary['post_piw_tune']:.3f}")
     print(
         f"calib mode: rounded={bool(allocator.calibration_summary['calibration_rounded'])} "
         f"folds={int(allocator.calibration_summary['calibration_folds'])}"
@@ -1611,7 +1790,7 @@ def run_backtest(target_coverage: float = 0.74) -> Dict[str, object]:
         "test_aiw": test_aiw,
     }
 
-def predict_future_games(target_coverage: float = 0.74) -> pd.DataFrame:
+def predict_future_games(target_coverage: float = DEFAULT_TARGET_COVERAGE) -> pd.DataFrame:
     artifacts = run_backtest(target_coverage=target_coverage)
     allocator: WidthAllocator = artifacts["allocator"]
 
@@ -1625,12 +1804,14 @@ def predict_future_games(target_coverage: float = 0.74) -> pd.DataFrame:
     all_train_mask = pd.Series(True, index=hist_df.index)
 
     hist_df, ridge_model, ridge_scaler = fit_ridge_baseline(hist_df, all_train_mask)
-    hist_df = hist_df.dropna(subset=XGB_POINT_FEATURES).copy()
+    hist_df = add_ridge_dependent_xgb_features(hist_df)
+    hist_df = hist_df.dropna(subset=[XGB_BASE_MARGIN_COL] + XGB_POINT_FEATURES).copy()
     hist_df = hist_df.sort_values("date_dt").reset_index(drop=True)
 
     xgb_model = fit_xgb_point_model(
         hist_df[XGB_POINT_FEATURES].values,
         hist_df["margin"].values,
+        pd.to_numeric(hist_df[XGB_BASE_MARGIN_COL], errors="coerce").values,
     )
 
     future_feat = merge_torvik_asof(future_games.copy(), torvik, SOURCE_STATS)
@@ -1648,19 +1829,25 @@ def predict_future_games(target_coverage: float = 0.74) -> pd.DataFrame:
 
     X_future_ridge = future_feat[RIDGE_FEATURES].values
     future_feat["ridge_pred_spread"] = ridge_model.predict(ridge_scaler.transform(X_future_ridge))
-    future_feat = future_feat.dropna(subset=XGB_POINT_FEATURES).copy()
+    future_feat = add_ridge_dependent_xgb_features(future_feat)
+    future_feat = future_feat.dropna(subset=[XGB_BASE_MARGIN_COL] + XGB_POINT_FEATURES).copy()
 
-    mu = xgb_model.predict(future_feat[XGB_POINT_FEATURES].values)
-    mu = dampen_point_predictions(mu)
+    mu_model = xgb_model.predict(
+        future_feat[XGB_POINT_FEATURES].values,
+        base_margin=pd.to_numeric(future_feat[XGB_BASE_MARGIN_COL], errors="coerce").values,
+    )
+    mu, center_rows, center_col = override_future_centers_with_point_spread(future_feat, mu_model)
     hw, meta_future = predict_half_widths(future_feat, mu, allocator)
     lower = mu - hw
     upper = mu + hw
+    lower_round, upper_round = round_interval_bounds(lower, upper)
+    piw_rounded = float(np.mean(upper_round - lower_round))
 
     out = future_feat.copy()
     out["predicted_margin"] = mu
-    out["lower_bound"] = lower
-    out["upper_bound"] = upper
-    out["interval_width"] = upper - lower
+    out["lower_bound"] = lower_round
+    out["upper_bound"] = upper_round
+    out["interval_width"] = upper_round - lower_round
 
     cols = [
         "event_id",
@@ -1673,18 +1860,31 @@ def predict_future_games(target_coverage: float = 0.74) -> pd.DataFrame:
         "interval_width",
     ]
     out[cols].to_csv(OUTPUT_PATH, index=False)
+    if center_rows > 0:
+        print(
+            f"point_center_override: source={POINT_CENTER_PATH} "
+            f"col={center_col if center_col is not None else 'unknown'} "
+            f"rows_overridden={center_rows}"
+        )
+    elif center_col is not None:
+        print(
+            f"point_center_override: source={POINT_CENTER_PATH} "
+            f"col={center_col} rows_overridden=0"
+        )
     print(
         f"saved: {OUTPUT_PATH} ({len(out)} games) "
         f"| exp_cov_base={meta_future['expected_cov_base']:.1%} "
         f"exp_cov_final={meta_future['expected_cov_final']:.1%} "
-        f"exp_cov_final_cal={meta_future['expected_cov_final_cal']:.1%}"
+        f"exp_cov_final_cal={meta_future['expected_cov_final_cal']:.1%} "
+        f"| calibration_piw={allocator.calibration_summary['post_piw_tune']:.3f} "
+        f"| future_piw={piw_rounded:.3f}"
     )
     return out[cols]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target-coverage", type=float, default=0.74)
+    parser.add_argument("--target-coverage", type=float, default=DEFAULT_TARGET_COVERAGE)
     parser.add_argument("--predict-future", action="store_true")
     args = parser.parse_args()
 
