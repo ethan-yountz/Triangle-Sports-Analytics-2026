@@ -15,22 +15,6 @@ Official standings: [winners](https://triangle-sports.github.io/winners.html) ·
 
 The pipeline is a **ridge regression baseline** with a **shallow XGBoost residual correction**, trained on Division I games and applied to ACC matchups. Team ratings are joined **as of the day before the game**, and later games are scored from a **frozen snapshot** so nothing after the submission cutoff leaks into features.
 
-```mermaid
-flowchart LR
-  ESPN[ESPN schedules and closing lines]
-  Torvik[Bart Torvik as-of efficiency]
-  Feat[Home-minus-away features]
-  Ridge[Ridge margin model]
-  XGB[XGBoost residual correction]
-  Out[Point spread and intervals]
-
-  ESPN --> Feat
-  Torvik --> Feat
-  Feat --> Ridge
-  Ridge --> XGB
-  XGB --> Out
-```
-
 ### Features (no leakage)
 
 Public team-level efficiency and context, expressed as home/away differences:
@@ -39,8 +23,6 @@ Public team-level efficiency and context, expressed as home/away differences:
 - Rest and congestion from the full D1 schedule (days since last game, games in the last 7 days)
 - Free-throw rate / foul-pressure interactions
 - Neutral-site indicator
-
-The model does **not** take the closing line as a feature. ESPN closes and an independent EvanMiya projection are used only after the model is fit (see below).
 
 Ratings are merged on `as_of_date = game_date - 1 day`. Walk-forward folds freeze every team's snapshot at the last date before the test window, so “future” games cannot see in-window updates.
 
@@ -80,10 +62,4 @@ Locked market blend (post-process on the model above):
 | `xgb_miya_blend_w_tune.py` | Lock the model–projection blend weight on earlier folds |
 | `xgb_final_point_submission_run.py` | Apply the locked Miya / Vegas blends for submission |
 
-`data/` holds the scraped tables and submission CSVs. Intermediate sweep files are local experiment artifacts, not part of the method.
-
 **Stack:** Python, pandas, NumPy, scikit-learn, XGBoost.
-
-## Why this matches the result
-
-College basketball margins are noisy (~9 MAE even for a strong line). The ridge layer captures the stable efficiency/tempo/rest signal; XGBoost is only allowed to correct systematic leftovers. A small, fold-locked shrink toward market lines is applied only when those lines exist. Intervals are treated as a constrained optimization problem (coverage first, width second), which is what the PIW metric actually rewards.
